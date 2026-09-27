@@ -75,6 +75,11 @@ export type EventPipelineInput = {
    * had been connected before.
    */
   onSpaceStream?: (details: { spaceId: string; status: "connected" | "disconnected"; wasReady: boolean }) => void
+  /**
+   * Called whenever the stream receives anything: an event, a WebSocket frame, or a keepalive
+   * that carries no event. Starting an attempt that has received nothing yet does not count.
+   */
+  onStreamActivity?: () => void
   transport?: "auto" | "ws" | "sse"
   heartbeatTimeoutMs?: number
   reconnectDelayMs?: number
@@ -306,6 +311,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     onDisconnect,
     onTransportSwitch,
     onSpaceStream,
+    onStreamActivity,
     routeDirectory,
     transport = "auto",
     heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS,
@@ -572,16 +578,22 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     heartbeat = undefined
   }
 
+  // Anything received proves the stream is alive, including keepalives that carry no event.
+  const noteStreamActivity = () => {
+    resetHeartbeat()
+    onStreamActivity?.()
+  }
+
   const runSseAttempt = async (signal: AbortSignal) => {
     // Keepalive comments carry no event but prove the socket is alive.
-    const events = sdk.event.subscribe({ signal, onActivity: resetHeartbeat })
+    const events = sdk.event.subscribe({ signal, onActivity: noteStreamActivity })
 
     let connected = false
     let yielded = Date.now()
     resetHeartbeat()
 
     for await (const event of events) {
-      resetHeartbeat()
+      noteStreamActivity()
       streamErrorLogged = false
       if (!connected) {
         connected = true
@@ -687,7 +699,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
       }
 
       socket.onmessage = (messageEvent) => {
-        resetHeartbeat()
+        noteStreamActivity()
         streamErrorLogged = false
 
         let raw: unknown

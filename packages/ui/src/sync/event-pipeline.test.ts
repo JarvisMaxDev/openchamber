@@ -32,9 +32,13 @@ function statusEvent(type: "busy" | "retry"): OpenCodeEvent {
 /** A raw stream payload: wire events, or OpenChamber's own bridge events. */
 type StreamPayload = OpenCodeEvent | { type: string; properties: Record<string, string> }
 
-function createSdk(events: StreamPayload[], streamFinished: () => void): OpenCodeClient {
-  const subscribe = ({ signal }: { signal?: AbortSignal }) => ({
+/** `keepalives` counts SSE comments sent before the events. They are activity without an event. */
+function createSdk(events: StreamPayload[], streamFinished: () => void, keepalives = 0): OpenCodeClient {
+  const subscribe = ({ signal, onActivity }: { signal?: AbortSignal; onActivity?: () => void }) => ({
     async *[Symbol.asyncIterator]() {
+      for (let sent = 0; sent < keepalives; sent += 1) {
+        onActivity?.()
+      }
       for (const payload of events) {
         yield payload as OpenCodeEvent
       }
@@ -196,5 +200,48 @@ describe("createEventPipeline", () => {
     }
     expect(announced).toEqual([{ spaceId: "a1b2c3d4e5f6", status: "connected", wasReady: false }])
     expect(delivered.map(describeEvent)).toEqual(["updated:a"])
+  })
+
+  test("reports keepalives that carry no event as stream activity", async () => {
+    let resolveStreamFinished!: () => void
+    const streamFinished = new Promise<void>((resolve) => { resolveStreamFinished = resolve })
+    const delivered: SyncEvent[] = []
+    let activity = 0
+    const pipeline = createEventPipeline({
+      sdk: createSdk([textEnded("a")], resolveStreamFinished, 2),
+      onEvents: (_directory, batch) => { delivered.push(...batch) },
+      onStreamActivity: () => { activity += 1 },
+      transport: "sse",
+      heartbeatTimeoutMs: 1_000,
+    })
+    try {
+      await streamFinished
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    } finally {
+      pipeline.cleanup()
+    }
+    // Two keepalives and one event; only the event is delivered.
+    expect(activity).toBe(3)
+    expect(delivered.map(describeEvent)).toEqual(["updated:a"])
+  })
+
+  test("reports no stream activity for an attempt that has received nothing", async () => {
+    let resolveStreamFinished!: () => void
+    const streamFinished = new Promise<void>((resolve) => { resolveStreamFinished = resolve })
+    let activity = 0
+    const pipeline = createEventPipeline({
+      sdk: createSdk([], resolveStreamFinished),
+      onEvents: () => undefined,
+      onStreamActivity: () => { activity += 1 },
+      transport: "sse",
+      heartbeatTimeoutMs: 1_000,
+    })
+    try {
+      await streamFinished
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    } finally {
+      pipeline.cleanup()
+    }
+    expect(activity).toBe(0)
   })
 })
