@@ -1,6 +1,9 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client"
 import type { SyncEvent } from "@/lib/opencode/events"
+import { adoptRelayTunnel, deactivateRelayTunnel } from "@/lib/relay/runtime-tunnel"
+import type { RelayTunnelClient, RelayTunnelWebSocket } from "@/lib/relay/tunnel-client"
+import { clearRuntimeUrlAuthToken, setRuntimeUrlAuthToken } from "@/lib/runtime-auth"
 import { createEventPipeline } from "./event-pipeline"
 
 const failAfter = (ms: number) => new Promise<never>((_, reject) => {
@@ -243,5 +246,80 @@ describe("createEventPipeline", () => {
       pipeline.cleanup()
     }
     expect(activity).toBe(0)
+  })
+})
+
+/** A relay tunnel socket the test drives by hand. */
+function createFakeSocket(): RelayTunnelWebSocket {
+  let readyState = 1
+  return {
+    get readyState() { return readyState },
+    onopen: null,
+    onmessage: null,
+    onerror: null,
+    onclose: null,
+    send: () => undefined,
+    close: () => { readyState = 3 },
+  }
+}
+
+describe("createEventPipeline over the WebSocket transport", () => {
+  beforeEach(() => {
+    Object.defineProperty(globalThis, "window", {
+      value: Object.assign(new EventTarget(), { location: new URL("http://runtime.test") }),
+      configurable: true,
+      writable: true,
+    })
+    // A valid URL token lets the attempt open the socket without minting one.
+    setRuntimeUrlAuthToken("fixture-url-token", Date.now() + 10 * 60_000)
+  })
+
+  afterEach(() => {
+    deactivateRelayTunnel()
+    clearRuntimeUrlAuthToken()
+    Reflect.deleteProperty(globalThis, "window")
+  })
+
+  test("counts a heartbeat frame as stream activity without delivering an event", async () => {
+    const paths: string[] = []
+    const sockets: RelayTunnelWebSocket[] = []
+    const tunnel: RelayTunnelClient = {
+      async fetch() { throw new Error("the WebSocket transport must not fetch") },
+      openWebSocket(pathWithQuery) {
+        paths.push(pathWithQuery)
+        const socket = createFakeSocket()
+        sockets.push(socket)
+        return socket
+      },
+      getStatus: () => ({ state: "connected" }),
+      subscribeStatus: () => () => undefined,
+      close: () => undefined,
+    }
+    adoptRelayTunnel({ relayUrl: "wss://relay.test", serverId: "fixture", hostEncPubJwk: {} }, tunnel)
+    const delivered: SyncEvent[] = []
+    let activity = 0
+    const pipeline = createEventPipeline({
+      sdk: createSdk([], () => undefined),
+      onEvents: (_directory, batch) => { delivered.push(...batch) },
+      onStreamActivity: () => { activity += 1 },
+      transport: "ws",
+      heartbeatTimeoutMs: 1_000,
+    })
+    try {
+      for (let i = 0; i < 20 && sockets.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(sockets).toHaveLength(1)
+      expect(paths[0]).toContain("/api/global/event/ws")
+      const socket = sockets[0]
+      socket.onmessage?.({ data: JSON.stringify({ type: "ready" }) })
+      socket.onmessage?.({
+        data: JSON.stringify({ type: "event", payload: { type: "openchamber:heartbeat", timestamp: 1 }, directory: "global" }),
+      })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    } finally {
+      pipeline.cleanup()
+    }
+    // The ready frame and the heartbeat frame both prove the socket is alive. Neither is an event.
+    expect(activity).toBe(2)
+    expect(delivered).toEqual([])
   })
 })
